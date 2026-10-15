@@ -1,4 +1,4 @@
-# ADR 0001: Ride fastmcp's proxy provider seam for fastmcp 4.x
+# ADR 0001: Use fastmcp's ProxyProvider seam (cache disabled) for fastmcp 4.x
 
 Date: 2026-10-15
 Status: Accepted
@@ -26,18 +26,37 @@ a pydantic model into a plain union type, breaking direct
 ## Decision
 
 Keep fastmcp's proxy implementation as the seam (no hand-rolled proxy) and
-migrate by surface change only:
+build the proxy server on the 4.x provider API:
 
-1. Import `FastMCPProxy` from `fastmcp.server.providers.proxy` and
-   `Tool`/`ToolResult` from `fastmcp.tools` (the `.tools.tool` module is gone).
-2. Pin `fastmcp==4.1.0` (exact pin retained; 4.x ships as two dists, `fastmcp`
+1. `ColabSessionProxy.start_proxy_server` creates a plain `FastMCP` and
+   attaches `ProxyProvider(client_factory, cache_ttl=0)` plus
+   `ProxyMetadataMiddleware(provider, identity="proxy")`.
+2. `cache_ttl=0` disables the provider's component-list cache: Colab's
+   toolset changes on browser connect/disconnect and the connectivity
+   notification cannot invalidate the provider cache (only a client-driven
+   `tools/list` refreshes it), so with the 300s default a `tools/call` in the
+   reconnect window could resolve from a stale cache. Regressed by
+   `test_tool_call_does_not_serve_stale_backend_after_disconnect`.
+3. Imports use the 4.x surfaces: `fastmcp.tools` for `Tool`/`ToolResult`, and
+   the 4.x context API (`await set_state`/`get_state`,
+   `send_notification(ToolListChangedNotification())`).
+4. Pin `fastmcp==4.1.0` (exact pin retained; 4.x ships as two dists, `fastmcp`
    + `fastmcp-slim`, which must be installed together).
-3. Validate incoming JSON-RPC through a module-level
+5. Validate incoming JSON-RPC through a module-level
    `pydantic.TypeAdapter(types.JSONRPCMessage)` in `websocket_server.py`,
    keeping the malformed-message path (send an `Exception` into the read
    stream) intact.
-4. Keep `ColabTransport`, `ColabProxyClient`, and the middleware stack
-   unchanged; the `client_factory` swap-on-connect seam is 4.x-compatible.
+6. Keep `ColabTransport` and `ColabProxyClient` unchanged; the
+   `client_factory` swap-on-connect seam is 4.x-compatible.
+
+Trade-offs accepted:
+
+- The `FastMCPProxy` convenience subclass was dropped (it hardcodes
+  `ProxyProvider(client_factory)` with the default 300s TTL and offers no
+  `cache_ttl` escape hatch). It is not deprecated in 4.1.0, so this can be
+  revisited if fastmcp adds a TTL passthrough.
+- The subclass's remote ping forwarding is dropped; the mcp SDK answers ping
+  locally, which also keeps health pings working while disconnected.
 
 Rejected alternative: implement our own thin proxy server on FastMCP
 primitives (dynamic tool registry + call forwarding). Rejected because the
@@ -48,27 +67,15 @@ and cancellation; owning that surface adds maintenance for no product gain.
 
 - Upgrades within 4.x should be low-friction; the seam is fastmcp's public
   provider API.
-- `FastMCPProxy` remains a convenience subclass; if fastmcp deprecates it in
-  favor of `FastMCP().add_provider(ProxyProvider(...))`, the migration is one
-  construction site in `ColabSessionProxy.start_proxy_server`.
-- The 4.x provider caches component lists (default TTL ~300s) and refreshes on
-  `list_*`. Colab's toolset changes on browser connect/disconnect; our
-  middleware already fires `send_tool_list_changed()` on state change, which
-  triggers a re-list. If staleness is ever observed, pass `cache_ttl=0` via
-  the provider path.
+- Every tool call/list hits the live backend (cache disabled) — acceptable
+  for a single-user local proxy over one websocket; revisit if latency ever
+  shows up in profiles.
 - The union-type `JSONRPCMessage` means code must never call model methods on
   it directly; use the `TypeAdapter`.
 
 ## Future decision points
 
-- Switch `FastMCPProxy` subclass to `add_provider(ProxyProvider(...))` idiom
-  when/if fastmcp signals subclass deprecation. Verified 2026-10-15 against
-  fastmcp 4.1.0: constructing `FastMCPProxy` emits **no** deprecation warning,
-  and the subclass adds behavior a bare `add_provider(ProxyProvider(...))`
-  swap would silently drop (`ProxyMetadataMiddleware`, remote ping
-  forwarding). Do not swap until fastmcp deprecates the subclass and provides
-  equivalents for both.
-- Tune or disable provider caching based on observed tool-list freshness.
-  Measured 2026-10-15 (`tests/proxy_freshness_test.py`): tool lists reflect
-  connect and disconnect immediately through the production assembly
-  (mount + middleware), so no caching change is needed today.
+- Return to the `FastMCPProxy` subclass if fastmcp deprecates the bare
+  provider API (unlikely) or adds a `cache_ttl` passthrough with a
+  connectivity-driven invalidation hook.
+- Re-enable provider caching if profiling ever shows list/call overhead.

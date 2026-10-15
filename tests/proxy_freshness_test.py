@@ -18,6 +18,8 @@ import json
 import pytest
 import websockets
 from fastmcp import Client, FastMCP
+from fastmcp.exceptions import ToolError
+from mcp.shared.exceptions import MCPError
 from mcp_types.version import LATEST_HANDSHAKE_VERSION
 from websockets.typing import Origin, Subprotocol
 
@@ -58,6 +60,11 @@ async def fake_colab_backend(client):
                         "inputSchema": {"type": "object", "properties": {}},
                     }
                 ]
+            }
+        elif method == "tools/call":
+            result = {
+                "content": [{"type": "text", "text": "ok"}],
+                "isError": False,
             }
         else:
             result = {}
@@ -126,5 +133,31 @@ async def test_tool_list_refreshes_on_disconnect():
 
             tools_after = {t.name for t in await mcp_client.list_tools()}
             assert tools_after == {session.INJECTED_TOOL_NAME}
+    finally:
+        await proxy.cleanup()
+
+
+@pytest.mark.asyncio
+async def test_tool_call_does_not_serve_stale_backend_after_disconnect():
+    """tools/call after disconnect fails instead of hitting a stale cached tool."""
+    proxy, mcp = await build_prod_server()
+    try:
+        async with Client(mcp) as mcp_client:
+            ws_client, backend = await connect_fake_colab(proxy)
+            result = await mcp_client.call_tool("echo", {})
+            assert not result.is_error
+
+            backend.cancel()
+            await ws_client.close()
+            await ws_client.wait_closed()
+            proxy_client = proxy.middleware[0].proxy_client
+            for _ in range(100):
+                if not proxy_client.is_connected():
+                    break
+                await asyncio.sleep(0.05)
+            assert not proxy_client.is_connected()
+
+            with pytest.raises((ToolError, MCPError)):
+                await mcp_client.call_tool("echo", {})
     finally:
         await proxy.cleanup()

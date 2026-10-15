@@ -24,7 +24,7 @@ from fastmcp.dependencies import CurrentContext
 from fastmcp.server.context import Context
 from fastmcp.server.middleware import Middleware, MiddlewareContext
 from fastmcp.server.middleware.tool_injection import ToolInjectionMiddleware
-from fastmcp.server.providers.proxy import FastMCPProxy
+from fastmcp.server.providers.proxy import ProxyMetadataMiddleware, ProxyProvider
 from fastmcp.tools import Tool, ToolResult
 from mcp.client.session import ClientSession
 from mcp.types import TextContent, ToolListChangedNotification
@@ -188,7 +188,7 @@ check_session_proxy_tool = Tool.from_function(
 class ColabSessionProxy:
     def __init__(self):
         self._exit_stack = AsyncExitStack()
-        self.proxy_server: FastMCPProxy | None = None
+        self.proxy_server: FastMCP | None = None
         # list order matters, see: https://gofastmcp.com/servers/middleware#multiple-middleware
         self.middleware: list[Middleware] = []
         self.wss: ColabWebSocketServer | None = None
@@ -198,9 +198,17 @@ class ColabSessionProxy:
         proxy_client = await self._exit_stack.enter_async_context(
             ColabProxyClient(self.wss)
         )
-        self.proxy_server = FastMCPProxy(
-            client_factory=proxy_client.client_factory,
+        self.proxy_server = FastMCP(
+            name="ColabMCPProxy",
             instructions="Connects to a user's Google Colab session in a browser and allows for interactions with their Google Colab notebook",
+        )
+        # cache_ttl=0: Colab's toolset changes on browser connect/disconnect and the
+        # connectivity notification cannot invalidate the provider cache, so tool
+        # lookups must always resolve against the live backend (see ADR 0001)
+        provider = ProxyProvider(proxy_client.client_factory, cache_ttl=0)
+        self.proxy_server.add_provider(provider)
+        self.proxy_server.add_middleware(
+            ProxyMetadataMiddleware(provider, identity="proxy")
         )
         # ColabProxyMiddleware must be first because it sets the fe_connected state
         self.middleware.append(ColabProxyMiddleware(proxy_client))
