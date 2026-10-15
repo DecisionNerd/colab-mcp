@@ -12,25 +12,31 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import anyio
-from anyio.streams.memory import MemoryObjectReceiveStream, MemoryObjectSendStream
 import asyncio
 import logging
-import mcp.types as types
-from mcp.shared.message import SessionMessage
-from pydantic_core import ValidationError
 import secrets
+
+import anyio
 import websockets
+from anyio.streams.memory import MemoryObjectReceiveStream, MemoryObjectSendStream
+from mcp import types
+from mcp.shared.message import SessionMessage
+from pydantic import TypeAdapter
+from pydantic_core import ValidationError
 from websockets.asyncio.server import ServerConnection
 from websockets.datastructures import Headers
 from websockets.exceptions import ConnectionClosed
 from websockets.http11 import Request, Response
-from websockets.typing import Subprotocol
-
+from websockets.typing import Origin, Subprotocol
 
 COLAB = "https://colab.research.google.com"
 COLAB_ALT_DOMAIN = "https://colab.google.com"
 SCRATCH_PATH = "/notebooks/empty.ipynb"
+
+logger = logging.getLogger(__name__)
+
+# mcp >= 2.3 defines JSONRPCMessage as a union, not a pydantic model
+_JSONRPC_MESSAGE_ADAPTER = TypeAdapter(types.JSONRPCMessage)
 
 
 class ColabWebSocketServer:
@@ -44,7 +50,7 @@ class ColabWebSocketServer:
         self.port = 0
         self.connection_lock = asyncio.Lock()
         self.connection_live = asyncio.Event()
-        self.allowed_origins = [COLAB, COLAB_ALT_DOMAIN]
+        self.allowed_origins: list[Origin] = [Origin(COLAB), Origin(COLAB_ALT_DOMAIN)]
         self._server: websockets.Server | None = None
 
         self.read_stream: MemoryObjectReceiveStream[SessionMessage | Exception]
@@ -64,7 +70,7 @@ class ColabWebSocketServer:
         """Listens to the socket and puts messages into the read stream."""
         async for msg in websocket:
             try:
-                client_message = types.JSONRPCMessage.model_validate_json(msg)
+                client_message = _JSONRPC_MESSAGE_ADAPTER.validate_json(msg)
             except ValidationError as exc:
                 await self._read_stream_writer.send(exc)
                 continue
@@ -111,7 +117,7 @@ class ColabWebSocketServer:
         Validates Origin and ensures single-client exclusivity.
         """
         if self.connection_lock.locked():
-            logging.warning(
+            logger.warning(
                 f"Connection rejected: {websocket.remote_address}. A client is already connected"
             )
             await websocket.close(code=1013, reason="Server is busy")
@@ -131,12 +137,12 @@ class ColabWebSocketServer:
                     task.cancel()
 
             except websockets.exceptions.ConnectionClosed as e:
-                logging.info(f"Connection closed: {e.code} - {e.reason}")
+                logger.info(f"Connection closed: {e.code} - {e.reason}")
                 await self._read_stream_writer.send(
                     Exception("Colab Frontend disconnected")
                 )
-            except Exception as e:
-                logging.error(f"Unexpected error: {e}")
+            except Exception as e:  # noqa: BLE001 - keep the server alive on any handler error
+                logger.error(f"Unexpected error: {e}")
             finally:
                 self.connection_live.clear()
 
@@ -150,11 +156,11 @@ class ColabWebSocketServer:
             process_request=self._validate_authorization,
         )
         self.port = self._server.sockets[0].getsockname()[1]
-        logging.info(f"Starting WebSocket server on ws://{self.host}:{self.port}")
+        logger.info(f"Starting WebSocket server on ws://{self.host}:{self.port}")
         return self
 
     async def __aexit__(self, exc_type, exc_val, exc_tb):
-        logging.info("Closing WebSocket server")
+        logger.info("Closing WebSocket server")
         if self._server:
             self._server.close()
             self.write_stream.close()

@@ -16,16 +16,16 @@ import argparse
 import asyncio
 import datetime
 import logging
-import tempfile
 import sys
+import tempfile
 
 from fastmcp import FastMCP
 from fastmcp.utilities import logging as fastmcp_logger
 
 from colab_mcp.session import ColabSessionProxy
 
-
 mcp = FastMCP(name="ColabMCP")
+logger = logging.getLogger(__name__)
 
 
 def init_logger(logdir):
@@ -38,7 +38,7 @@ def init_logger(logdir):
         filename=log_filename,
         level=logging.INFO,  # Set the minimum logging level to capture
     )
-    fastmcp_logger.get_logger("colab-mcp").info("logging to %s" % log_filename)
+    fastmcp_logger.get_logger("colab-mcp").info(f"logging to {log_filename}")
 
 
 def parse_args(v):
@@ -48,8 +48,8 @@ def parse_args(v):
     parser.add_argument(
         "-l",
         "--log",
-        help="if set, use this directory as a location for logfiles (if unset, will log to %s/colab-mcp-logs/)"
-        % tempfile.gettempdir(),
+        help="if set, use this directory as a location for logfiles "
+        f"(if unset, will log to {tempfile.gettempdir()}/colab-mcp-logs/)",
         action="store",
         default=tempfile.mkdtemp(prefix="colab-mcp-logs-"),
     )
@@ -68,9 +68,10 @@ async def main_async():
     init_logger(args.log)
 
     if args.enable_proxy:
-        logging.info("enabling session proxy tools")
+        logger.info("enabling session proxy tools")
         session_mcp = ColabSessionProxy()
         await session_mcp.start_proxy_server()
+        assert session_mcp.proxy_server is not None
         mcp.mount(session_mcp.proxy_server)
         for middleware in session_mcp.middleware:
             mcp.add_middleware(middleware)
