@@ -13,22 +13,23 @@
 # limitations under the License.
 
 import asyncio
-from collections.abc import AsyncIterator
 import contextlib
+import webbrowser
+from collections.abc import AsyncGenerator
 from contextlib import AsyncExitStack
-from fastmcp import FastMCP, Client
+
+from fastmcp import Client, FastMCP
 from fastmcp.client.transports import ClientTransport
 from fastmcp.dependencies import CurrentContext
 from fastmcp.server.context import Context
 from fastmcp.server.middleware import Middleware, MiddlewareContext
 from fastmcp.server.middleware.tool_injection import ToolInjectionMiddleware
-from fastmcp.server.proxy import FastMCPProxy
-from fastmcp.tools.tool import Tool, ToolResult
+from fastmcp.server.providers.proxy import FastMCPProxy
+from fastmcp.tools import Tool, ToolResult
 from mcp.client.session import ClientSession
-from mcp.types import TextContent
-import webbrowser
+from mcp.types import TextContent, ToolListChangedNotification
 
-from colab_mcp.websocket_server import ColabWebSocketServer, COLAB, SCRATCH_PATH
+from colab_mcp.websocket_server import COLAB, SCRATCH_PATH, ColabWebSocketServer
 
 UI_CONNECTION_TIMEOUT = 60.0  # secs
 
@@ -43,7 +44,7 @@ class ColabTransport(ClientTransport):
         self.wss = wss
 
     @contextlib.asynccontextmanager
-    async def connect_session(self, **session_kwargs) -> AsyncIterator[ClientSession]:
+    async def connect_session(self, **session_kwargs) -> AsyncGenerator[ClientSession]:
         async with ClientSession(
             self.wss.read_stream, self.wss.write_stream, **session_kwargs
         ) as session:
@@ -67,6 +68,7 @@ class ColabProxyClient:
     async def await_proxy_connection(self):
         with contextlib.suppress(asyncio.TimeoutError):
             # wait for the connection to be live and for the proxy client to fully initialize
+            assert self._start_task is not None, "proxy client not started"
             connection_tasks = asyncio.gather(
                 self.wss.connection_live.wait(), self._start_task
             )
@@ -107,11 +109,13 @@ class ColabProxyMiddleware(Middleware):
         Check for a change to Colab session connectivity on any communication with this MCP server and
         notify the client when the connectivity status has changed.
         """
-        context.fastmcp_context.set_state(
+        fastmcp_context = context.fastmcp_context
+        assert fastmcp_context is not None, "middleware invoked outside a request"
+        await fastmcp_context.set_state(
             FE_CONNECTED_KEY, self.proxy_client.is_connected()
         )
-        context.fastmcp_context.set_state(PROXY_TOKEN_KEY, self.proxy_client.wss.token)
-        context.fastmcp_context.set_state(PROXY_PORT_KEY, self.proxy_client.wss.port)
+        await fastmcp_context.set_state(PROXY_TOKEN_KEY, self.proxy_client.wss.token)
+        await fastmcp_context.set_state(PROXY_PORT_KEY, self.proxy_client.wss.port)
 
         result = await call_next(context)
 
@@ -119,7 +123,7 @@ class ColabProxyMiddleware(Middleware):
         connection_state_changed = connected != self.last_message_connected
         self.last_message_connected = connected
         if connection_state_changed:
-            await context.fastmcp_context.send_tool_list_changed()
+            await fastmcp_context.send_notification(ToolListChangedNotification())
 
         return result
 
@@ -159,10 +163,13 @@ class ColabProxyMiddleware(Middleware):
             )
 
 
-async def check_session_proxy_tool_fn(ctx: Context = CurrentContext()) -> bool:
-    fe_connected = ctx.get_state(FE_CONNECTED_KEY)
-    token = ctx.get_state(PROXY_TOKEN_KEY)
-    port = ctx.get_state(PROXY_PORT_KEY)
+# CurrentContext() is fastmcp dependency injection, not a real default value
+async def check_session_proxy_tool_fn(
+    ctx: Context = CurrentContext(),  # noqa: B008
+) -> bool:
+    fe_connected = await ctx.get_state(FE_CONNECTED_KEY)
+    token = await ctx.get_state(PROXY_TOKEN_KEY)
+    port = await ctx.get_state(PROXY_PORT_KEY)
     if fe_connected:
         return True
     webbrowser.open_new(
